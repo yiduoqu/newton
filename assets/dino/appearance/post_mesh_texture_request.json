@@ -1,0 +1,9 @@
+{
+  "appearance_manifest_path": "outputs/agentic_asset_refinement/dino_retry_20260910_02/dino_retry_20260910_02/revisions/revision_0000/omnipart/rubber_dino/appearance/appearance_manifest.json",
+  "heterogeneous_params_path": "outputs/agentic_asset_refinement/dino_retry_20260910_02/dino_retry_20260910_02/revisions/revision_0000/mesh_processing/assign_monolithic_mesh_params/heterogeneous_params.npz",
+  "inferred_material_path": "outputs/agentic_asset_refinement/dino_retry_20260910_02/dino_retry_20260910_02/revisions/revision_0000/material_inference/dino_retry_20260910_02.json",
+  "metric_mesh_scaling_path": "outputs/agentic_asset_refinement/dino_retry_20260910_02/dino_retry_20260910_02/revisions/revision_0000/mesh_processing/combined_to_monolithic/metric_mesh_scaling.json",
+  "monolithic_mesh_path": "outputs/agentic_asset_refinement/dino_retry_20260910_02/dino_retry_20260910_02/revisions/revision_0000/mesh_processing/combined_to_monolithic/dino_retry_20260910_02.mesh",
+  "output_dir": "outputs/agentic_asset_refinement/dino_retry_20260910_02/dino_retry_20260910_02/revisions/revision_0000/mesh_processing/post_mesh_texture",
+  "schema_version": "hag4r-post-mesh-texture-request-v1"
+}

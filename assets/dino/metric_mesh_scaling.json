@@ -1,0 +1,63 @@
+{
+  "metric_bounds": {
+    "extent": [
+      0.06834518536925316,
+      0.13517557903961797,
+      0.18344834287969147
+    ],
+    "max": [
+      0.0344059020280838,
+      0.06637022718624729,
+      0.09177280962467194
+    ],
+    "max_extent": 0.18344834287969147,
+    "min": [
+      -0.03393928334116936,
+      -0.06880535185337067,
+      -0.09167553325501952
+    ]
+  },
+  "note": "Mesh was scaled before voxelization and tetrahedralization.",
+  "output_mesh_path": "outputs/agentic_asset_refinement/dino_retry_20260910_02/dino_retry_20260910_02/revisions/revision_0000/mesh_processing/combined_to_monolithic/dino_retry_20260910_02.mesh",
+  "output_mesh_sha256": "5abc2c7309b07cbf6c5be9483d72c379ba66aabdae78c5914c79889cc5557ae1",
+  "pre_tetrahedralization_metric_bounds": {
+    "extent": [
+      0.06515407494516635,
+      0.13290028556699177,
+      0.18
+    ],
+    "max": [
+      0.03302288802934623,
+      0.0661821858903982,
+      0.08988145521353653
+    ],
+    "max_extent": 0.18,
+    "min": [
+      -0.03213118691582013,
+      -0.06671809967659356,
+      -0.09011854478646346
+    ]
+  },
+  "scale_factor": 0.1800965737596648,
+  "scaling_mode": "pre_monolithic_target_max_dimension",
+  "schema_version": "hag4r-metric-max-dimension-scaling-v1",
+  "source_bounds": {
+    "extent": [
+      0.36177298426628113,
+      0.7379390001296997,
+      0.9994637668132782
+    ],
+    "max": [
+      0.18336211144924164,
+      0.36748164892196655,
+      0.49907365441322327
+    ],
+    "max_extent": 0.9994637668132782,
+    "min": [
+      -0.1784108728170395,
+      -0.37045735120773315,
+      -0.5003901124000549
+    ]
+  },
+  "target_max_dimension_m": 0.18
+}

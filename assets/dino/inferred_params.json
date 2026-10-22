@@ -1,0 +1,163 @@
+{
+  "schema_version": "hag4r-agentic-gpt-staged-material-inference-v1",
+  "image_path": "/workspace/HAG4R-runpod/outputs/agentic_asset_refinement/dino_retry_20260910_02/dino_retry_20260910_02/revisions/revision_0000/omnipart/rubber_dino/mesh_combined_part_labels_top.png",
+  "processed_image_path": "/workspace/HAG4R-runpod/outputs/agentic_asset_refinement/dino_retry_20260910_02/dino_retry_20260910_02/revisions/revision_0000/segmentation/rubber_dino/rubber_dino_white_bg.png",
+  "part_colors_path": "/workspace/HAG4R-runpod/outputs/agentic_asset_refinement/dino_retry_20260910_02/dino_retry_20260910_02/revisions/revision_0000/omnipart/rubber_dino/part_labels.npz",
+  "num_parts": 2,
+  "inferred_object_name": "upright yellow-and-green rubber dinosaur toy",
+  "geometry_inference": {
+    "inferred_object_name": "upright yellow-and-green rubber dinosaur toy",
+    "predictions": [
+      {
+        "attachment_pattern": "single connected molded body with head, neck, torso, limbs, tail, and loop integrated into the same surface",
+        "geometric_category": "large continuous molded dinosaur body",
+        "geometry_description": "Main continuous toy surface forming the broad torso, raised head and neck with open mouth, four stout legs and feet, smooth tapered tail, and the small open attachment loop under the tail.",
+        "part_color_rgb": [
+          141.0,
+          211.0,
+          199.0
+        ],
+        "part_index": 0,
+        "relative_size": "very large; contains nearly the entire visible toy"
+      },
+      {
+        "attachment_pattern": "surface-attached to the head/snout area of the continuous body",
+        "geometric_category": "small surface accent patches",
+        "geometry_description": "Very small pale accent geometry visible mainly on the head and snout region, appearing as shallow attached patches on the main dinosaur surface.",
+        "part_color_rgb": [
+          255.0,
+          255.0,
+          179.0
+        ],
+        "part_index": 1,
+        "relative_size": "very small relative to the dinosaur body"
+      }
+    ]
+  },
+  "fill_mode_decision": {
+    "schema_version": "hag4r-material-fill-mode-decision-v1",
+    "inferred_object_name": "upright yellow-and-green rubber dinosaur toy",
+    "predictions": [
+      {
+        "fill_mode_evidence": [
+          "Broad occupied body silhouette across all six indexed views",
+          "Thick torso, neck, limbs, and tapered tail are not sheet-like shells",
+          "The head-to-neck and leg-to-body connections are integral to the accepted shape"
+        ],
+        "fill_mode_rationale": "The main part is a thick, compact molded rubber toy body whose torso, neck, head, four legs, tail, and loop should retain their continuous volume for robust tetrahedral meshing.",
+        "part_color_rgb": [
+          141.0,
+          211.0,
+          199.0
+        ],
+        "part_index": 0,
+        "volume_fill_mode": "solid_fill"
+      },
+      {
+        "fill_mode_evidence": [
+          "Small localized patches are compact rather than broad thin panels",
+          "Accent geometry is surface-attached to the head and should remain a filled solid feature",
+          "No visible enclosed shell or sheet-like topology is present in the indexed views"
+        ],
+        "fill_mode_rationale": "The tiny head/snout accent geometry is a compact attached molded feature; solid filling avoids losing its already small volume during downstream meshing.",
+        "part_color_rgb": [
+          255.0,
+          255.0,
+          179.0
+        ],
+        "part_index": 1,
+        "volume_fill_mode": "solid_fill"
+      }
+    ]
+  },
+  "geometry_stage_notes": [
+    "Analyzed the six OmniPart segmented views; kept geometry description separate from topology and material judgments."
+  ],
+  "fill_mode_stage_notes": [
+    "Selected solid_fill for both the thick molded body and compact head/snout accents; no shell/thickness claims."
+  ],
+  "semantics_stage_notes": [
+    "Applied the recovered rubber_flexible profile to both indexed surfaces because the candidate is one uniform flexible rubber toy; numeric tuple is exact and bound in each part_semantics string."
+  ],
+  "stage_attempts": {
+    "geometry": [
+      {
+        "attempt_index": 1,
+        "error": "",
+        "stage": "part_geometry",
+        "status": "success"
+      }
+    ],
+    "fill_mode": [
+      {
+        "attempt_index": 1,
+        "error": "",
+        "stage": "fill_mode",
+        "status": "success"
+      }
+    ],
+    "semantics": [
+      {
+        "attempt_index": 1,
+        "error": "",
+        "stage": "constitutive_parameters",
+        "status": "success"
+      }
+    ],
+    "repair": [
+      {
+        "error": "",
+        "stage": "material_validation",
+        "status": "success"
+      }
+    ]
+  },
+  "predictions": [
+    {
+      "density_kg_m3": 1100,
+      "friction_coefficient": 0.9,
+      "major_material_name": "rubber",
+      "part_color_rgb": [
+        141.0,
+        211.0,
+        199.0
+      ],
+      "part_index": 0,
+      "part_name": "continuous_dinosaur_rubber_body",
+      "part_semantics": "Thick flexible molded rubber forming the continuous torso, raised neck and head, open mouth, four stout legs and feet, tapered tail, and open attachment loop; profile=rubber_flexible; tuple density_kg_m3=1100, youngs_modulus_pa=5000000, poisson_ratio=0.49, friction_coefficient=0.9",
+      "part_texture": "soft matte pebbled rubber with yellow upper surfaces and green underside/side shading",
+      "poisson_ratio": 0.49,
+      "youngs_modulus_pa": 5000000,
+      "volume_fill_mode": "solid_fill",
+      "fill_mode_rationale": "The main part is a thick, compact molded rubber toy body whose torso, neck, head, four legs, tail, and loop should retain their continuous volume for robust tetrahedral meshing.",
+      "fill_mode_evidence": [
+        "Broad occupied body silhouette across all six indexed views",
+        "Thick torso, neck, limbs, and tapered tail are not sheet-like shells",
+        "The head-to-neck and leg-to-body connections are integral to the accepted shape"
+      ]
+    },
+    {
+      "density_kg_m3": 1100,
+      "friction_coefficient": 0.9,
+      "major_material_name": "rubber",
+      "part_color_rgb": [
+        255.0,
+        255.0,
+        179.0
+      ],
+      "part_index": 1,
+      "part_name": "rubber_head_snout_accents",
+      "part_semantics": "Small attached pale accent features on the head and snout of the same flexible molded rubber toy, retained as compact solid details; profile=rubber_flexible; tuple density_kg_m3=1100, youngs_modulus_pa=5000000, poisson_ratio=0.49, friction_coefficient=0.9",
+      "part_texture": "smooth-to-matte pale yellow rubber accent surface",
+      "poisson_ratio": 0.49,
+      "youngs_modulus_pa": 5000000,
+      "volume_fill_mode": "solid_fill",
+      "fill_mode_rationale": "The tiny head/snout accent geometry is a compact attached molded feature; solid filling avoids losing its already small volume during downstream meshing.",
+      "fill_mode_evidence": [
+        "Small localized patches are compact rather than broad thin panels",
+        "Accent geometry is surface-attached to the head and should remain a filled solid feature",
+        "No visible enclosed shell or sheet-like topology is present in the indexed views"
+      ]
+    }
+  ]
+}

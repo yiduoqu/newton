@@ -1624,6 +1624,19 @@ add_example_test(
 )
 
 
+class TestDinoTwistExample(NewtonTestCase):
+    pass
+
+
+add_example_test(
+    TestDinoTwistExample,
+    name="multiphysics.example_dino_twist",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 372, "test_timeout": 1800},
+    use_viewer=True,
+)
+
+
 class TestMultiphysicsExamples(NewtonTestCase):
     pass
 

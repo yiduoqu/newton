@@ -1010,12 +1010,15 @@ class ViewerGL(ViewerBase):
         if color is not None:
             self.objects[name].color = (float(color[0]), float(color[1]), float(color[2]))
 
-        if roughness is not None or metallic is not None:
+        if texture is not None or roughness is not None or metallic is not None:
             r, m, c, t = self.objects[name].material
             if roughness is not None:
                 r = float(roughness)
             if metallic is not None:
                 m = float(metallic)
+            if texture is not None:
+                # The shader samples the albedo map only when this flag is set.
+                t = 1.0
             self.objects[name].material = (r, m, c, t)
 
     def _update_mesh_instancer(

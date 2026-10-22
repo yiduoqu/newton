@@ -74,3 +74,6 @@ docs/_static/viser/
 
 # Notebook checkpoints
 **/*.ipynb_checkpoints/
+
+# Local demo recordings and intermediate renders
+results/
