@@ -58,6 +58,7 @@ from .particle_vbd_kernels import (
     forward_step,
     gather_particle_body_contact_force_and_hessian,
     make_solve_elasticity_tile,
+    relax_self_contact_anchors,
     reset_particle_state,
     scatter_particle_body_contact_force_and_hessian,
     solve_elasticity,
@@ -92,6 +93,7 @@ from .rigid_vbd_kernels import (
     init_rod_rest_bend_twist,
     refresh_body_structural_k,
     refresh_joint_material_params,
+    relax_body_particle_contact_anchors,
     reset_rigid_state,
     snapshot_body_body_contact_history,
     step_body_body_contact_C0_lambda,
@@ -174,6 +176,15 @@ def _rigid_lambda_retention(alpha: float, gamma: float, use_compliant_alm: bool)
     residual. The legacy path keeps its historical ``alpha * gamma`` policy.
     """
     return gamma if use_compliant_alm else alpha * gamma
+
+
+def _anchored_soft_contacts(contacts: Contacts) -> bool:
+    """Whether soft contact records keep their contact points across collision passes.
+
+    Sticky contact matching replays a matched record's soft and body points, so friction can act
+    on their drift and hold a static tangential load.
+    """
+    return contacts._soft_contact_points_persist
 
 
 class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
@@ -442,7 +453,12 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
 
             iterations: Number of VBD iterations per step.
             friction_epsilon: Threshold to smooth small relative velocities in friction computation (used for both particle
-                and rigid body contacts).
+                and rigid body contacts). Below it, friction is proportional to slip, so a contact measured
+                only by its motion within each collision pass creeps under any static tangential load. Body-particle
+                contacts from a ``CollisionPipeline(contact_matching="sticky")`` instead measure slip from contact
+                points that persist across passes, and hold such a load. Up to the matching position
+                threshold, sliding friction then opposes the drift from those points rather than the
+                current slip direction.
             dat_conservative_bound_relaxation: Relaxation factor in (0, 1) shared by every Divide-and-Truncate
                 (DAT) truncation: soft self-contact (``particle_enable_self_contact``) and rigid-soft
                 (``rigid_soft_enable_dat``). It scales every truncation scalar, and each side's motion
@@ -1667,6 +1683,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                     self.model.body_com,
                     float(self.friction_epsilon),
                     self.rigid_soft_contact_use_log_barrier,
+                    _anchored_soft_contacts(contacts),
                     self.body_particle_contact_penalty_k,
                     self.body_particle_contact_material_kd,
                     self.body_particle_contact_material_mu,
@@ -1746,6 +1763,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                     int(ParticleFlags.PROXY),
                     self.friction_epsilon,
                     self.rigid_soft_contact_use_log_barrier,
+                    _anchored_soft_contacts(contacts),
                     self.model.particle_radius,
                     contacts.soft_contact_count,
                     _make_soft_contact_filter_data(self.model, contacts, state.particle_q, body_q_for_particles),
@@ -2821,7 +2839,58 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         if update_tendon_diagnostics:
             self._update_tendon_segment_diagnostics(state_out, dt)
         self._finalize_particles(state_out, dt)
+        self._relax_body_particle_contact_anchors(state_out, contacts, dt)
+        self._relax_self_contact_anchors(state_out, dt)
         self._save_tendon_history(state_out)
+
+    def _relax_body_particle_contact_anchors(self, state_out: State, contacts: Contacts | None, dt: float):
+        """Keep persistent body-particle contact points within the friction regularization length."""
+        if contacts is None or not _anchored_soft_contacts(contacts) or self._particle_contact_worker_count == 0:
+            return
+        wp.launch(
+            relax_body_particle_contact_anchors,
+            dim=self._particle_contact_worker_count,
+            inputs=[
+                self.friction_epsilon * dt,
+                self._particle_contact_worker_count,
+                state_out.particle_q,
+                state_out.body_q if state_out.body_q is not None else self._empty_body_q,
+                self.model.shape_body,
+                contacts.soft_contact_count,
+                contacts.soft_contact_max,
+                contacts.soft_contact_indices,
+                contacts.soft_contact_barycentric,
+                contacts.soft_contact_shape,
+                contacts.soft_contact_normal,
+                contacts.soft_contact_body_vel,
+            ],
+            outputs=[contacts.soft_contact_body_pos],
+            device=self.device,
+        )
+
+    def _relax_self_contact_anchors(self, state_out: State, dt: float):
+        """Keep self-contact friction anchors within the friction regularization length."""
+        if not self.particle_enable_self_contact or self.collision_pipeline is None:
+            return
+        collision_info = self._pipeline_contacts.soft_self_contact_data
+        if (
+            collision_info.vertex_colliding_triangles_anchor.shape[0] == 0
+            and collision_info.edge_colliding_edges_anchor.shape[0] == 0
+        ):
+            return
+        wp.launch(
+            relax_self_contact_anchors,
+            dim=max(self.model.particle_count, self.model.edge_count),
+            inputs=[
+                self.friction_epsilon * dt,
+                self._self_contact_edge_edge_parallel_epsilon,
+                state_out.particle_q,
+                self.model.tri_indices,
+                self.model.edge_indices,
+                collision_info,
+            ],
+            device=self.device,
+        )
 
     @override
     def reset(
@@ -2868,7 +2937,10 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         history is intentionally left untouched: ``particle_q_prev`` is rebaselined
         from the incoming state at the start of the next :meth:`step`, self-contact
         and body-particle contacts rebuild per step, and tet/cloth elasticity is
-        stateless, so no particle history cold-start is required. Reset does not
+        stateless, so no particle history cold-start is required. Sticky
+        self-contact friction anchors live in the collision pipeline and survive
+        reset; call :meth:`~newton.CollisionPipeline.reset_contact_matching` to
+        forget them. Reset does not
         refresh the particle self-contact BVH; the next :meth:`step` refits it from
         the incoming positions. After a large reset displacement, call
         :meth:`rebuild_bvh` to restore acceleration-structure quality. Both reset
@@ -3193,12 +3265,15 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         *,
         run_rigid_collision: bool,
         run_soft_self_collision: bool,
+        before_initialization: bool,
     ):
         """Run selected collision detectors, then reset their DAT references."""
         if run_rigid_collision:
             self._run_rigid_collision(state, dt)
         if run_soft_self_collision:
-            self._collision_detection_penetration_free(state, reset_reference=False)
+            self._collision_detection_penetration_free(
+                state, reset_reference=False, before_initialization=before_initialization
+            )
 
         reset_rigid_soft = run_rigid_collision and self.rigid_soft_enable_dat
         reset_particles = reset_rigid_soft or (run_soft_self_collision and self.particle_enable_self_contact)
@@ -4045,6 +4120,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                             state_in.particle_q,
                             self.friction_epsilon,
                             self.rigid_soft_contact_use_log_barrier,
+                            _anchored_soft_contacts(contacts),
                             model.particle_radius,
                             contacts.soft_contact_indices,
                             self._particle_contact_head,
@@ -4072,6 +4148,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                             self.model.particle_colors,
                             self.friction_epsilon,
                             self.rigid_soft_contact_use_log_barrier,
+                            _anchored_soft_contacts(contacts),
                             model.particle_radius,
                             contacts.soft_contact_indices,
                             contacts.soft_contact_count,
@@ -4476,6 +4553,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                         model.shape_body,
                         self.friction_epsilon,
                         self.rigid_soft_contact_use_log_barrier,
+                        _anchored_soft_contacts(contacts),
                         self.body_particle_contact_penalty_k,
                         self.body_particle_contact_material_ke,
                         self.body_particle_contact_material_kd,
@@ -4860,6 +4938,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 model.body_com,
                 self.friction_epsilon,
                 self.rigid_soft_contact_use_log_barrier,
+                _anchored_soft_contacts(contacts),
                 self.body_particle_contact_penalty_k,
                 self.body_particle_contact_material_kd,
                 self.body_particle_contact_material_mu,
@@ -5177,7 +5256,13 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             (Frequency.PRE_INIT, Frequency.PRE_POST_INIT, Frequency.ITERATIONS)
         )
         if rigid_due or soft_due:
-            self._refresh_collision_sets(state_in, dt, run_rigid_collision=rigid_due, run_soft_self_collision=soft_due)
+            self._refresh_collision_sets(
+                state_in,
+                dt,
+                run_rigid_collision=rigid_due,
+                run_soft_self_collision=soft_due,
+                before_initialization=True,
+            )
         return rigid_due
 
     def _mid_step_detection(
@@ -5204,7 +5289,11 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         if rigid_due and preserve_history:
             self._snapshot_rigid_contact_history(contacts, force=True)
         self._refresh_collision_sets(
-            collision_state, dt, run_rigid_collision=rigid_due, run_soft_self_collision=soft_due
+            collision_state,
+            dt,
+            run_rigid_collision=rigid_due,
+            run_soft_self_collision=soft_due,
+            before_initialization=False,
         )
         if rigid_due:
             self._refresh_rigid_contact_state(contacts, refresh=True, restore_history=preserve_history)
@@ -5234,7 +5323,13 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 "equivalent RIGID and SOFT_SELF_CONTACT schedules (same type; same frequency for ITERATIONS)."
             )
 
-    def _collision_detection_penetration_free(self, current_state: State, *, reset_reference: bool = True):
+    def _collision_detection_penetration_free(
+        self,
+        current_state: State,
+        *,
+        reset_reference: bool = True,
+        before_initialization: bool = True,
+    ):
         # particle_displacements is based on pos_prev_collision_detection
         # so reset them every time we do collision detection
         if reset_reference:
@@ -5242,7 +5337,18 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             self.particle_displacements.zero_()
 
         if self.collision_pipeline is not None:
-            self.collision_pipeline._detect_soft_self_contact(current_state.particle_q, self._pipeline_contacts)
+            # Friction anchors sit at the step start, which initialization copies into particle_q_prev.
+            # Before initialization, a post-initialization pass may replace these pairs before any
+            # friction is evaluated, so it alone needs anchors.
+            if not before_initialization:
+                anchor_q = self.particle_q_prev
+            elif self._self_contact_mode_this_step == SolverBase.CollisionFrequencyType.PRE_POST_INIT:
+                anchor_q = None
+            else:
+                anchor_q = current_state.particle_q
+            self.collision_pipeline._detect_soft_self_contact(
+                current_state.particle_q, self._pipeline_contacts, anchor_q
+            )
         else:
             self.trimesh_collision_detector.refit(current_state.particle_q)
             self.trimesh_collision_detector.vertex_triangle_collision_detection(

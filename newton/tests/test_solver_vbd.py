@@ -15,6 +15,14 @@ import warp as wp
 import newton
 from newton._src.geometry.soft_contacts_mesh import _SoftContactFilterData
 from newton._src.geometry.tri_mesh_collision import build_tri_mesh_collision_info
+from newton._src.geometry.tri_mesh_collision import (
+    TriMeshCollisionInfo,
+    build_tri_mesh_collision_info,
+    edge_edge_anchor,
+    edge_edge_anchor_slip,
+    get_edge_colliding_edges_count,
+)
+from newton._src.solvers.vbd import particle_vbd_kernels, rigid_vbd_kernels
 from newton._src.solvers.vbd.particle_vbd_kernels import (
     NUM_THREADS_PER_COLLISION_PRIMITIVE,
     TILE_SIZE_TRI_MESH_ELASTICITY_SOLVE,
@@ -584,6 +592,7 @@ def accumulate_particle_body_contact_force_and_hessian(
                 shape_margin,
                 dt,
                 use_log_barrier,
+                False,
             )
             wp.atomic_add(particle_forces, particle_idx, body_contact_force)
             wp.atomic_add(particle_hessians, particle_idx, body_contact_hessian)
@@ -613,6 +622,7 @@ def accumulate_particle_body_contact_force_and_hessian(
             shape_margin,
             dt,
             use_log_barrier,
+            False,
         )
         for i in range(3):
             ci = corners[i]
@@ -673,6 +683,7 @@ def _eval_vertex_triangle_uniform_motion_kernel(
     pos: wp.array[wp.vec3],
     pos_prev: wp.array[wp.vec3],
     tri_indices: wp.array2d[wp.int32],
+    friction_anchors: wp.array[wp.vec3],
     forces: wp.array[wp.vec3],
     hessians: wp.array[wp.mat33],
 ):
@@ -700,6 +711,8 @@ def _eval_vertex_triangle_uniform_motion_kernel(
         0.0,
         0.01,
         0.1,
+        friction_anchors,
+        -1,
     )
     forces[i] = force_3
     hessians[i] = hessian_3
@@ -1008,6 +1021,7 @@ def _eval_vertex_triangle_contact_rigid_motion_kernel(
     soft_pos: wp.array[wp.vec3],
     soft_pos_anchor: wp.array[wp.vec3],
     tri_indices: wp.array2d[wp.int32],
+    friction_anchors: wp.array[wp.vec3],
     damping_delta_norms: wp.array[float],
 ):
     sample = wp.tid()
@@ -1035,6 +1049,8 @@ def _eval_vertex_triangle_contact_rigid_motion_kernel(
         0.0,
         0.01,
         dt,
+        friction_anchors,
+        -1,
     )
     (
         _has_contact_undamped,
@@ -1058,6 +1074,8 @@ def _eval_vertex_triangle_contact_rigid_motion_kernel(
         0.0,
         0.01,
         dt,
+        friction_anchors,
+        -1,
     )
     soft_delta = wp.max(wp.length(force_0_damped - force_0_undamped), wp.length(force_1_damped - force_1_undamped))
     soft_delta = wp.max(soft_delta, wp.length(force_2_damped - force_2_undamped))
@@ -2156,6 +2174,214 @@ def _body_particle_contact_damping_is_absolute(test, device):
         np.testing.assert_allclose(damping_low_ke, [0.0, 0.0, 2.0], rtol=1.0e-6, atol=1.0e-6)
 
 
+def _soft_block_on_tilted_box(load: float | tuple, full_surface: bool, sticky: bool, substeps: int, seconds: tuple):
+    """Mean positions of a soft block resting on a static box under gravity tilted along x.
+
+    The tangential load is ``load`` times the friction limit mu * N. Returns the block's mean position
+    after each duration in ``seconds``, advanced in turn.
+    """
+    mu = 0.5
+    fps = 60
+    dt = 1.0 / (fps * substeps)
+    builder = newton.ModelBuilder()
+    builder.add_shape_box(
+        body=-1, xform=wp.transform(wp.vec3(0.0, 0.0, -0.01), wp.quat_identity()), hx=0.5, hy=0.5, hz=0.01
+    )
+    builder.add_soft_grid(
+        pos=wp.vec3(0.0, 0.0, 0.006),
+        rot=wp.quat_identity(),
+        vel=wp.vec3(0.0),
+        dim_x=3,
+        dim_y=3,
+        dim_z=1,
+        cell_x=0.02,
+        cell_y=0.02,
+        cell_z=0.02,
+        density=200.0,
+        k_mu=3.0e4,
+        k_lambda=3.0e4,
+        k_damp=0.0,
+        particle_radius=0.004,
+    )
+    builder.color()
+    model = builder.finalize()
+    model.soft_contact_mu = mu
+    model.shape_material_mu.fill_(mu)
+    pipeline = newton.CollisionPipeline(
+        model,
+        soft_contact_gap=0.01,
+        enable_rigid_soft_full_surface_contact=full_surface,
+        contact_matching="sticky" if sticky else "disabled",
+    )
+    solver = newton.solvers.SolverVBD(model, iterations=10)
+    state_0, state_1, contacts = model.state(), model.state(), pipeline.contacts()
+
+    positions = []
+    loads = load if isinstance(load, tuple) else (load,) * len(seconds)
+    for duration, window_load in zip(seconds, loads, strict=True):
+        tilt = math.atan(window_load * mu)
+        model.set_gravity((9.81 * math.sin(tilt), 0.0, -9.81 * math.cos(tilt)))
+        for _ in range(round(duration * fps * substeps)):
+            pipeline.collide(state_0, contacts)
+            solver.step(state_0, state_1, None, contacts, dt)
+            state_0, state_1 = state_1, state_0
+        positions.append(state_0.particle_q.numpy().mean(axis=0))
+    return positions
+
+
+def _sticky_soft_contacts_hold_static_load(test, device, full_surface, substeps):
+    """With sticky contact matching, a soft block under a tangential load inside the friction cone stays put.
+
+    Regularized friction is proportional to slip, so it holds no static load: measured from the motion
+    since the last collision pass, the block creeps about 3 mm/s here, 0.6 mm over the hold. Sticky soft records keep their
+    contact points, and friction acting on their drift holds the block. Each entry in ``substeps`` is
+    a time step to check.
+    """
+    with wp.ScopedDevice(device):
+        for count in substeps:
+            settled, held = _soft_block_on_tilted_box(0.5, full_surface, True, count, (0.3, 0.2))
+            test.assertGreater(settled[2], 0.0)
+            test.assertLess(abs(held[0] - settled[0]), 2.0e-5, f"substeps={count}")
+
+
+def _sticky_soft_contacts_slide_beyond_friction_cone(test, device):
+    """Sticky soft contacts slide like fresh ones once the tangential load exceeds mu * N."""
+    with wp.ScopedDevice(device):
+        (fresh,) = _soft_block_on_tilted_box(1.5, False, False, 5, (0.3,))
+        (sticky,) = _soft_block_on_tilted_box(1.5, False, True, 5, (0.3,))
+    test.assertGreater(fresh[0], 0.05)
+    np.testing.assert_allclose(sticky[0], fresh[0], rtol=0.02)
+
+
+def _sticky_soft_contacts_stop_without_springback(test, device, full_surface):
+    """A block that slides on sticky body-particle contacts and then stops stays where it stopped.
+
+    While the block decelerates, each collision pass moves it less than the matching threshold, so the
+    kept points could trail it by nearly the threshold and pull it back up to 0.3 mm once it stops.
+    VBD drags them to within the friction regularization length after each step.
+    """
+    with wp.ScopedDevice(device):
+        positions = _soft_block_on_tilted_box((1.5,) + (0.0,) * 30, full_surface, True, 5, (0.12,) + (0.01,) * 30)
+    xs = np.array([p[0] for p in positions[1:]])
+    test.assertGreater(xs.max() - positions[0][0], 5.0e-4)
+    test.assertLess(xs.max() - xs[-1], 1.0e-4)
+
+
+def _sticky_soft_contacts_hold_pinched_block(test, device):
+    """With sticky contact matching, a soft block squeezed between two static pads hangs on friction alone."""
+    width = 0.06
+    squeeze = 0.002
+    fps, substeps = 60, 5
+    dt = 1.0 / (fps * substeps)
+    with wp.ScopedDevice(device):
+        builder = newton.ModelBuilder()
+        for side in (-1.0, 1.0):
+            builder.add_shape_box(
+                body=-1,
+                xform=wp.transform(wp.vec3(side * (0.5 * width - squeeze + 0.01), 0.5 * width, 0.5 * width)),
+                hx=0.01,
+                hy=0.05,
+                hz=0.05,
+            )
+        builder.add_soft_grid(
+            pos=wp.vec3(-0.5 * width, 0.0, 0.0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0),
+            dim_x=3,
+            dim_y=3,
+            dim_z=3,
+            cell_x=width / 3,
+            cell_y=width / 3,
+            cell_z=width / 3,
+            density=200.0,
+            k_mu=3.0e4,
+            k_lambda=3.0e4,
+            k_damp=0.0,
+            particle_radius=0.004,
+        )
+        builder.color()
+        model = builder.finalize()
+        model.soft_contact_mu = 0.5
+        model.shape_material_mu.fill_(0.5)
+        pipeline = newton.CollisionPipeline(model, soft_contact_gap=0.01, contact_matching="sticky")
+        solver = newton.solvers.SolverVBD(model, iterations=10)
+        state_0, state_1, contacts = model.state(), model.state(), pipeline.contacts()
+
+        heights = []
+        for duration in (0.3, 0.5):
+            for _ in range(round(duration * fps * substeps)):
+                pipeline.collide(state_0, contacts)
+                solver.step(state_0, state_1, None, contacts, dt)
+                state_0, state_1 = state_1, state_0
+            heights.append(state_0.particle_q.numpy()[:, 2].mean())
+
+    # Without sticky records, the block slides down about 0.13 mm/s.
+    test.assertGreater(heights[0], 0.5 * width - 0.001)
+    test.assertLess(abs(heights[1] - heights[0]), 2.0e-5)
+
+
+def _sticky_soft_contacts_ride_moving_surface(test, device):
+    """A soft block on a conveyor mesh rides it with sticky contact matching as without it.
+
+    The belt's material moves away from any point fixed in the body frame, so sticky records on a
+    surface with surface velocity must keep fresh contact points; otherwise friction pins the block.
+    """
+    fps, substeps = 60, 5
+    dt = 1.0 / (fps * substeps)
+    speed = 0.1
+
+    def block_speed(sticky):
+        belt = newton.Mesh(
+            np.array([[-1.0, -1.0, 0.0], [1.0, -1.0, 0.0], [1.0, 1.0, 0.0], [-1.0, 1.0, 0.0]], dtype=np.float32),
+            np.array([0, 1, 2, 0, 2, 3], dtype=np.int32),
+            enable_surface_velocity=True,
+        )
+        builder = newton.ModelBuilder()
+        builder.add_shape_mesh(body=-1, mesh=belt)
+        builder.add_soft_grid(
+            pos=wp.vec3(0.0, 0.0, 0.006),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0),
+            dim_x=3,
+            dim_y=3,
+            dim_z=1,
+            cell_x=0.02,
+            cell_y=0.02,
+            cell_z=0.02,
+            density=200.0,
+            k_mu=3.0e4,
+            k_lambda=3.0e4,
+            k_damp=0.0,
+            particle_radius=0.004,
+        )
+        builder.color()
+        model = builder.finalize()
+        model.soft_contact_mu = 0.5
+        model.shape_material_mu.fill_(0.5)
+        belt.mesh.velocities.fill_(wp.vec3(speed, 0.0, 0.0))
+        pipeline = newton.CollisionPipeline(
+            model, soft_contact_gap=0.01, contact_matching="sticky" if sticky else "disabled"
+        )
+        solver = newton.solvers.SolverVBD(model, iterations=10)
+        state_0, state_1, contacts = model.state(), model.state(), pipeline.contacts()
+        positions = []
+        for duration in (0.3, 0.2):
+            for _ in range(round(duration * fps)):
+                # One collision pass per frame, as the examples do, so records outlive several substeps.
+                pipeline.collide(state_0, contacts)
+                for _ in range(substeps):
+                    solver.step(state_0, state_1, None, contacts, dt)
+                    state_0, state_1 = state_1, state_0
+            positions.append(state_0.particle_q.numpy()[:, 0].mean())
+        return (positions[1] - positions[0]) / 0.2
+
+    with wp.ScopedDevice(device):
+        fresh = block_speed(False)
+        sticky = block_speed(True)
+    test.assertGreater(fresh, 0.5 * speed)
+    np.testing.assert_allclose(sticky, fresh, rtol=0.05)
+
+
 def _body_particle_contact_damping_ignores_penalty_ramp(test, device):
     """Ramped body-particle contact stiffness must not scale absolute damping."""
     with wp.ScopedDevice(device):
@@ -2205,6 +2431,7 @@ def _body_particle_contact_damping_ignores_penalty_ramp(test, device):
                 particle_q,
                 0.01,
                 False,  # legacy quadratic rigid-soft normal law
+                False,  # rigid_body_particle_contact_anchored_friction
                 particle_radius,
                 contact_indices,
                 contact_head,
@@ -2342,6 +2569,7 @@ def _launch_particle_contact_gather(data, contact_count, contact_head, contact_n
                 data["particle_q"],
                 1.0,
                 False,  # rigid_body_particle_contact_use_log_barrier
+                False,  # rigid_body_particle_contact_anchored_friction
                 data["particle_radius"],
                 data["contact_indices"],
                 contact_head,
@@ -2404,6 +2632,7 @@ def _particle_contact_gather_order_pinned(test, device):
                     data["particle_q"],
                     1.0,
                     False,  # rigid_body_particle_contact_use_log_barrier
+                    False,  # rigid_body_particle_contact_anchored_friction
                     data["particle_radius"],
                     data["contact_indices"],
                     rev_head_wp,
@@ -2646,6 +2875,7 @@ def _launch_particle_contact_scatter(data, contact_count, worker_count, forces, 
                 data["particle_colors"],
                 1.0,
                 False,  # rigid_body_particle_contact_use_log_barrier
+                False,  # rigid_body_particle_contact_anchored_friction
                 data["particle_radius"],
                 data["contact_indices"],
                 contact_count,
@@ -3219,7 +3449,7 @@ def _contact_damping_ignores_rigid_motion(test, device):
         wp.launch(
             _eval_vertex_triangle_contact_rigid_motion_kernel,
             dim=sample_count,
-            inputs=[soft_pos, soft_pos_anchor, tri_indices],
+            inputs=[soft_pos, soft_pos_anchor, tri_indices, wp.empty(0, dtype=wp.vec3, device=device)],
             outputs=[soft_delta_norms],
             device=device,
         )
@@ -3262,13 +3492,235 @@ def _self_contact_damping_uses_relative_gap_rate(test, device):
         wp.launch(
             _eval_vertex_triangle_uniform_motion_kernel,
             dim=2,
-            inputs=[pos, pos_prev, tri_indices],
+            inputs=[pos, pos_prev, tri_indices, wp.empty(0, dtype=wp.vec3, device=device)],
             outputs=[forces, hessians],
             device=device,
         )
 
         np.testing.assert_allclose(forces.numpy()[1], forces.numpy()[0], rtol=1.0e-6, atol=1.0e-6)
         np.testing.assert_allclose(hessians.numpy()[1], hessians.numpy()[0], rtol=1.0e-6, atol=1.0e-6)
+
+
+@wp.kernel
+def _translate_kinematic_particles_kernel(delta: wp.vec3, q_0: wp.array[wp.vec3], q_1: wp.array[wp.vec3]):
+    i = wp.tid()
+    q_0[i] = q_0[i] + delta
+    q_1[i] = q_0[i]
+
+
+def _soft_block_on_pinned_sheet(
+    load: float | tuple, matching: str, substeps: int, seconds: tuple, sheet_speeds: tuple | None = None
+):
+    """Mean positions of a soft block resting on a pinned cloth sheet under gravity tilted along x.
+
+    Only self-contact holds the block: the sheet has zero mass and there are no shapes. The tangential
+    load is ``load`` times the friction limit mu * N. During each duration in ``seconds`` the load is
+    the matching entry of ``load`` when it is a tuple, and the sheet slides along x at the matching
+    entry of ``sheet_speeds``, moved between steps as kinematic particles are. Returns the block's
+    mean position after each duration, advanced in turn.
+    """
+    mu = 0.5
+    radius = 0.004
+    fps = 60
+    dt = 1.0 / (fps * substeps)
+    builder = newton.ModelBuilder()
+    builder.add_cloth_grid(
+        pos=wp.vec3(-0.2, -0.2, 0.0),
+        rot=wp.quat_identity(),
+        vel=wp.vec3(0.0),
+        dim_x=8,
+        dim_y=8,
+        cell_x=0.05,
+        cell_y=0.05,
+        mass=0.0,
+        tri_ke=1.0e2,
+        tri_ka=1.0e2,
+        tri_kd=0.0,
+        particle_radius=radius,
+    )
+    sheet_count = builder.particle_count
+    builder.add_soft_grid(
+        pos=wp.vec3(-0.03, -0.03, radius + 0.0015),
+        rot=wp.quat_identity(),
+        vel=wp.vec3(0.0),
+        dim_x=3,
+        dim_y=3,
+        dim_z=1,
+        cell_x=0.02,
+        cell_y=0.02,
+        cell_z=0.02,
+        density=200.0,
+        k_mu=3.0e4,
+        k_lambda=3.0e4,
+        k_damp=0.0,
+        particle_radius=radius,
+    )
+    builder.color()
+    model = builder.finalize()
+    model.soft_contact_mu = mu
+    solver = newton.solvers.SolverVBD(
+        model,
+        iterations=10,
+        collision_pipeline=newton.CollisionPipeline(model, contact_matching=matching),
+        particle_enable_self_contact=True,
+        particle_self_contact_margin=radius,
+        particle_self_contact_gap=radius,
+    )
+    state_0, state_1 = model.state(), model.state()
+
+    positions = []
+    loads = load if isinstance(load, tuple) else (load,) * len(seconds)
+    for duration, window_load, sheet_speed in zip(seconds, loads, sheet_speeds or (0.0,) * len(seconds), strict=True):
+        tilt = math.atan(window_load * mu)
+        model.set_gravity((9.81 * math.sin(tilt), 0.0, -9.81 * math.cos(tilt)))
+        for _ in range(round(duration * fps * substeps)):
+            wp.launch(
+                _translate_kinematic_particles_kernel,
+                dim=sheet_count,
+                inputs=[wp.vec3(sheet_speed * dt, 0.0, 0.0), state_0.particle_q[:sheet_count]],
+                outputs=[state_1.particle_q[:sheet_count]],
+            )
+            solver.step(state_0, state_1, None, None, dt)
+            state_0, state_1 = state_1, state_0
+        positions.append(state_0.particle_q.numpy()[sheet_count:].mean(axis=0))
+    return positions
+
+
+def _sticky_self_contacts_hold_static_load(test, device, substeps):
+    """With sticky contact matching, a soft block under a tangential load inside the friction cone stays put on cloth.
+
+    Self-contact friction is regularized like body-particle friction, so it holds no static load: the
+    block creeps about 3 mm/s here, 0.6 mm over the hold, at any time step. Each entry in ``substeps``
+    is a time step to check.
+    """
+    with wp.ScopedDevice(device):
+        for count in substeps:
+            settled, held = _soft_block_on_pinned_sheet(0.5, "sticky", count, (0.3, 0.2))
+            test.assertGreater(settled[2], 0.0)
+            test.assertLess(abs(held[0] - settled[0]), 2.0e-5, f"substeps={count}")
+
+
+def _sticky_self_contacts_slide_beyond_friction_cone(test, device):
+    """Sticky self-contacts hold no load beyond mu * N: the block slides about as far as on fresh contacts.
+
+    The two differ by a few percent at this iteration count, either way as iterations grow, because an
+    anchored slip spans several steps and softens the friction Hessian the iterations see.
+    """
+    with wp.ScopedDevice(device):
+        (fresh,) = _soft_block_on_pinned_sheet(1.5, "disabled", 5, (0.3,))
+        (sticky,) = _soft_block_on_pinned_sheet(1.5, "sticky", 5, (0.3,))
+    test.assertGreater(fresh[0], 0.05)
+    test.assertGreater(sticky[0], 0.9 * fresh[0])
+
+
+def _sticky_self_contacts_ride_moving_sheet(test, device):
+    """A block resting on a kinematic sheet that starts to slide rides along on sticky self-contacts.
+
+    Kinematic particles move between steps, so the step's relative motion misses the sheet's travel and
+    regularized friction leaves the block in place while the sheet slides under it. The anchors move
+    with the sheet, so friction measured from them carries the block along: it catches up within
+    0.2 s, about 5 mm behind, then rides at the sheet's speed.
+    """
+    with wp.ScopedDevice(device):
+        settled, caught_up, rode = _soft_block_on_pinned_sheet(
+            0.0, "sticky", 5, (0.3, 0.2, 0.2), sheet_speeds=(0.0, 0.1, 0.1)
+        )
+    test.assertGreater(caught_up[0] - settled[0], 0.01)
+    np.testing.assert_allclose(rode[0] - caught_up[0], 0.02, rtol=0.01)
+
+
+def _sticky_self_contacts_stop_without_springback(test, device):
+    """A block that slides on sticky self-contacts and then stops stays where it stopped.
+
+    While the block decelerates, each pass moves it less than the matching threshold, so the anchors
+    could trail it by nearly the threshold and pull it back up to 0.4 mm once it stops. The solver
+    drags them to within the friction regularization length after each step.
+    """
+    with wp.ScopedDevice(device):
+        positions = _soft_block_on_pinned_sheet((1.5,) + (0.0,) * 30, "sticky", 5, (0.1,) + (0.01,) * 30)
+    xs = np.array([p[0] for p in positions[1:]])
+    test.assertGreater(xs.max() - positions[0][0], 0.002)
+    test.assertLess(xs.max() - xs[-1], 1.0e-4)
+
+
+@wp.kernel
+def _edge_edge_anchor_tangential_slip_kernel(
+    parallel_epsilon: float,
+    particle_q: wp.array[wp.vec3],
+    edge_indices: wp.array2d[wp.int32],
+    collision_info: TriMeshCollisionInfo,
+    max_slip: wp.array[float],
+    pair_count: wp.array[wp.int32],
+):
+    e1 = wp.tid()
+    p0 = particle_q[edge_indices[e1, 2]]
+    p1 = particle_q[edge_indices[e1, 3]]
+    for i in range(get_edge_colliding_edges_count(collision_info, e1)):
+        slot = collision_info.edge_colliding_edges_offsets[e1] + i
+        e2 = collision_info.edge_colliding_edges[2 * slot + 1]
+        if e2 >= 0:
+            q0 = particle_q[edge_indices[e2, 2]]
+            q1 = particle_q[edge_indices[e2, 3]]
+            closest = edge_edge_anchor(p0, p1, q0, q1, parallel_epsilon)
+            normal = wp.normalize(edge_edge_anchor_slip(closest, p0, p1, q0, q1))
+            offset = edge_edge_anchor_slip(collision_info.edge_colliding_edges_anchor[slot], p0, p1, q0, q1)
+            wp.atomic_max(max_slip, 0, wp.length(offset - wp.dot(offset, normal) * normal))
+            wp.atomic_add(pair_count, 0, 1)
+
+
+def _sticky_edge_only_self_contacts_relax_anchors(test, device):
+    """With no vertex-triangle capacity, a cloth sliding on cloth ends each step near its edge-edge anchors.
+
+    The solver drags the anchors to within the friction regularization length after each step; skipping
+    that leaves them trailing the sliding cloth by millimeters.
+    """
+    radius = 0.004
+    dt = 1.0 / 300.0
+    builder = newton.ModelBuilder()
+    for pos, dim, cell, mass in (((-0.2, -0.2, 0.0), 8, 0.05, 0.0), ((-0.06, -0.06, radius + 0.0015), 4, 0.03, 0.01)):
+        builder.add_cloth_grid(
+            pos=wp.vec3(pos),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0),
+            dim_x=dim,
+            dim_y=dim,
+            cell_x=cell,
+            cell_y=cell,
+            mass=mass,
+            tri_ke=1.0e2,
+            tri_ka=1.0e2,
+            tri_kd=0.0,
+            particle_radius=radius,
+        )
+    builder.color()
+    with wp.ScopedDevice(device):
+        model = builder.finalize()
+        model.soft_contact_mu = 0.5
+        tilt = math.atan(1.5 * model.soft_contact_mu)
+        model.set_gravity((9.81 * math.sin(tilt), 0.0, -9.81 * math.cos(tilt)))
+        solver = newton.solvers.SolverVBD(
+            model,
+            iterations=10,
+            collision_pipeline=newton.CollisionPipeline(model, contact_matching="sticky"),
+            particle_enable_self_contact=True,
+            particle_self_contact_margin=radius,
+            particle_self_contact_gap=radius,
+            particle_vertex_contact_buffer_size=0,
+        )
+        state_0, state_1 = model.state(), model.state()
+        for _ in range(60):
+            solver.step(state_0, state_1, None, None, dt)
+            state_0, state_1 = state_1, state_0
+        max_slip = wp.zeros(1, dtype=float)
+        pair_count = wp.zeros(1, dtype=wp.int32)
+        wp.launch(
+            _edge_edge_anchor_tangential_slip_kernel,
+            dim=model.edge_count,
+            inputs=[1.0e-5, state_0.particle_q, model.edge_indices, solver._pipeline_contacts.soft_self_contact_data],
+            outputs=[max_slip, pair_count],
+        )
+    test.assertGreater(pair_count.numpy()[0], 0)
+    test.assertLessEqual(max_slip.numpy()[0], 1.01 * solver.friction_epsilon * dt)
 
 
 def _d6_fully_free_structural_slots_are_inactive(test, device):
@@ -6050,6 +6502,54 @@ add_function_test(
 )
 add_function_test(
     TestSolverVBD,
+    "test_sticky_soft_contacts_hold_static_load",
+    _sticky_soft_contacts_hold_static_load,
+    devices=devices,
+    full_surface=False,
+    substeps=(5, 10),
+)
+add_function_test(
+    TestSolverVBD,
+    "test_sticky_soft_contacts_hold_static_load_full_surface",
+    _sticky_soft_contacts_hold_static_load,
+    devices=devices,
+    full_surface=True,
+    substeps=(5,),
+)
+add_function_test(
+    TestSolverVBD,
+    "test_sticky_soft_contacts_slide_beyond_friction_cone",
+    _sticky_soft_contacts_slide_beyond_friction_cone,
+    devices=devices,
+)
+add_function_test(
+    TestSolverVBD,
+    "test_sticky_soft_contacts_stop_without_springback",
+    _sticky_soft_contacts_stop_without_springback,
+    devices=devices,
+    full_surface=False,
+)
+add_function_test(
+    TestSolverVBD,
+    "test_sticky_soft_contacts_stop_without_springback_full_surface",
+    _sticky_soft_contacts_stop_without_springback,
+    devices=devices,
+    full_surface=True,
+)
+add_function_test(
+    TestSolverVBD,
+    "test_sticky_soft_contacts_hold_pinched_block",
+    _sticky_soft_contacts_hold_pinched_block,
+    devices=devices,
+)
+add_function_test(
+    TestSolverVBD,
+    "test_sticky_soft_contacts_ride_moving_surface",
+    _sticky_soft_contacts_ride_moving_surface,
+    devices=devices,
+)
+add_function_test(
+    TestSolverVBD,
     "test_body_particle_contact_damping_ignores_penalty_ramp",
     _body_particle_contact_damping_ignores_penalty_ramp,
     devices=devices,
@@ -6166,6 +6666,37 @@ add_function_test(
     TestSolverVBD,
     "test_self_contact_damping_uses_relative_gap_rate",
     _self_contact_damping_uses_relative_gap_rate,
+    devices=devices,
+)
+add_function_test(
+    TestSolverVBD,
+    "test_sticky_self_contacts_hold_static_load",
+    _sticky_self_contacts_hold_static_load,
+    devices=devices,
+    substeps=(5, 10),
+)
+add_function_test(
+    TestSolverVBD,
+    "test_sticky_self_contacts_slide_beyond_friction_cone",
+    _sticky_self_contacts_slide_beyond_friction_cone,
+    devices=devices,
+)
+add_function_test(
+    TestSolverVBD,
+    "test_sticky_self_contacts_ride_moving_sheet",
+    _sticky_self_contacts_ride_moving_sheet,
+    devices=devices,
+)
+add_function_test(
+    TestSolverVBD,
+    "test_sticky_self_contacts_stop_without_springback",
+    _sticky_self_contacts_stop_without_springback,
+    devices=devices,
+)
+add_function_test(
+    TestSolverVBD,
+    "test_sticky_edge_only_self_contacts_relax_anchors",
+    _sticky_edge_only_self_contacts_relax_anchors,
     devices=devices,
 )
 add_function_test(
@@ -6634,6 +7165,7 @@ def _run_face_section2(device, shape_margin):
             state.particle_q,
             1.0,  # friction_epsilon
             False,  # rigid_body_particle_contact_use_log_barrier
+            False,  # rigid_body_particle_contact_anchored_friction
             model.particle_radius,
             contacts.soft_contact_indices,
             contact_head,
