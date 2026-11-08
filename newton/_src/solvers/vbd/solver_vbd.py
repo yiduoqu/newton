@@ -1297,6 +1297,9 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 self.body_particle_attachment_offsets,
                 self.body_particle_attachment_indices,
             ) = self._compute_body_particle_attachment_adjacency(model)
+            # Threads sharing each body's attachments: up to 64, fewer when no body has that many.
+            per_body = np.diff(self.body_particle_attachment_offsets.numpy())
+            self._body_attachment_threads = int(min(64, max(1, per_body.max(initial=0))))
 
             # Force accumulation arrays
             self.body_torques = wp.zeros(model.body_count, dtype=wp.vec3, device=self.device)
@@ -4428,10 +4431,11 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             if model.attachment_particle_body_count > 0:
                 wp.launch(
                     kernel=accumulate_body_particle_attachments_per_body,
-                    dim=color_group.size,
+                    dim=color_group.size * self._body_attachment_threads,
                     inputs=[
                         dt,
                         color_group,
+                        self._body_attachment_threads,
                         state_in.particle_q,
                         self.particle_q_prev,
                         state_in.body_q,

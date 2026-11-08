@@ -5865,6 +5865,7 @@ def _fill_body_particle_attachments_per_body(
 def accumulate_body_particle_attachments_per_body(
     dt: float,
     color_group: wp.array[int],
+    threads_per_body: int,
     particle_q: wp.array[wp.vec3],
     particle_q_prev: wp.array[wp.vec3],
     body_q: wp.array[wp.transform],
@@ -5884,8 +5885,14 @@ def accumulate_body_particle_attachments_per_body(
     body_hessian_al: wp.array[wp.mat33],
     body_hessian_aa: wp.array[wp.mat33],
 ):
-    """Accumulate particle-body attachment forces and Hessians on each rigid body."""
-    body_idx_in_group = wp.tid()
+    """Accumulate particle-body attachment forces and Hessians on each rigid body.
+
+    ``threads_per_body`` threads share each body's attachments, striding over them, so a
+    body with hundreds of attachments is not one serial loop per iteration.
+    """
+    tid = wp.tid()
+    body_idx_in_group = tid // threads_per_body
+    lane = tid - body_idx_in_group * threads_per_body
     body_id = color_group[body_idx_in_group]
     if body_inv_mass[body_id] <= 0.0:
         return
@@ -5898,7 +5905,9 @@ def accumulate_body_particle_attachments_per_body(
 
     start = body_attachment_offsets[body_id]
     end = body_attachment_offsets[body_id + 1]
-    for i in range(start, end):
+    if start + lane >= end:
+        return
+    for i in range(start + lane, end, threads_per_body):
         attachment = body_attachment_indices[i]
         if not attachment_enabled[attachment]:
             continue
@@ -5927,13 +5936,12 @@ def accumulate_body_particle_attachments_per_body(
         h_al_acc += h_al
         h_aa_acc += h_aa
 
-    # One thread per body_id in this launch (unlike the contact kernels below, which run
-    # several threads per body), so a plain read-add-write cannot race within this kernel.
-    body_forces[body_id] = body_forces[body_id] + force_acc
-    body_torques[body_id] = body_torques[body_id] + torque_acc
-    body_hessian_ll[body_id] = body_hessian_ll[body_id] + h_ll_acc
-    body_hessian_al[body_id] = body_hessian_al[body_id] + h_al_acc
-    body_hessian_aa[body_id] = body_hessian_aa[body_id] + h_aa_acc
+    # Several threads per body, as in the contact kernels below, so the sums are atomic.
+    wp.atomic_add(body_forces, body_id, force_acc)
+    wp.atomic_add(body_torques, body_id, torque_acc)
+    wp.atomic_add(body_hessian_ll, body_id, h_ll_acc)
+    wp.atomic_add(body_hessian_al, body_id, h_al_acc)
+    wp.atomic_add(body_hessian_aa, body_id, h_aa_acc)
 
 
 @wp.kernel
