@@ -5460,6 +5460,12 @@ def _body_particle_attachment_accumulates_body_csr(test, device):
     np.testing.assert_array_equal(solver.body_particle_attachment_offsets.numpy(), [0, 3])
     np.testing.assert_array_equal(solver.body_particle_attachment_indices.numpy(), [0, 1, 2])
 
+    # One thread for the body, and several sharing its attachments: the sums must agree.
+    for threads in (1, 2, 4):
+        _check_body_particle_attachment_accumulation(test, device, model, solver, body, threads)
+
+
+def _check_body_particle_attachment_accumulation(test, device, model, solver, body, threads):
     body_forces = wp.zeros(model.body_count, dtype=wp.vec3, device=device)
     body_torques = wp.zeros(model.body_count, dtype=wp.vec3, device=device)
     body_hessian_ll = wp.zeros(model.body_count, dtype=wp.mat33, device=device)
@@ -5467,10 +5473,11 @@ def _body_particle_attachment_accumulates_body_csr(test, device):
     body_hessian_aa = wp.zeros(model.body_count, dtype=wp.mat33, device=device)
     wp.launch(
         accumulate_body_particle_attachments_per_body,
-        dim=1,
+        dim=threads,
         inputs=[
             1.0,
             wp.array([body], dtype=int, device=device),
+            threads,
             model.particle_q,
             model.particle_q,
             model.body_q,
