@@ -6440,6 +6440,7 @@ def create_solve_rigid_body(has_tendons: bool):
         tendon_segment_active: wp.array[int],
         tendon_segment_active_guide_l: wp.array[int],
         tendon_segment_active_guide_r: wp.array[int],
+        body_com_residual: wp.array[wp.vec3],
         # Output
         body_q_new: wp.array[wp.transform],
     ):
@@ -6511,7 +6512,8 @@ def create_solve_rigid_body(has_tendons: bool):
 
         # Linear inertial force and Hessian
         inertial_coeff = m * dt_sqr_reciprocal
-        f_lin = (com_star - com_current) * inertial_coeff
+        # The residual is the sub-ulp part of the COM that float32 rounding dropped.
+        f_lin = ((com_star - com_current) - body_com_residual[body_index]) * inertial_coeff
 
         # Compute relative rotation via quaternion difference
         # dq = q_current^-1 * q_star
@@ -6680,8 +6682,10 @@ def create_solve_rigid_body(has_tendons: bool):
         rot_new = wp.normalize(rot_new)
 
         # Update position
-        com_new = com_current + x_inc
-        pos_new = com_new - wp.quat_rotate(rot_new, body_com_local)
+        step = body_com_residual[body_index] + x_inc
+        pos_new = (com_current + step) - wp.quat_rotate(rot_new, body_com_local)
+        # Keep what rounding loses, measured against the COM the next read will see.
+        body_com_residual[body_index] = (com_current - (pos_new + wp.quat_rotate(rot_new, body_com_local))) + step
 
         body_q_new[body_index] = wp.transform(pos_new, rot_new)
 
@@ -7501,7 +7505,9 @@ def update_body_velocity(
     dt: float,
     body_q: wp.array[wp.transform],
     body_com: wp.array[wp.vec3],
+    body_com_residual: wp.array[wp.vec3],
     body_q_prev: wp.array[wp.transform],
+    body_com_residual_prev: wp.array[wp.vec3],
     body_qd: wp.array[wp.spatial_vector],
     body_qd_mirror: wp.array[wp.spatial_vector],
     body_q_out: wp.array[wp.transform],
@@ -7546,7 +7552,8 @@ def update_body_velocity(
     x_com_prev = x_prev + wp.quat_rotate(q_prev, com_local)
 
     # Linear velocity
-    v = (x_com - x_com_prev) / dt
+    v = ((x_com - x_com_prev) + (body_com_residual[tid] - body_com_residual_prev[tid])) / dt
+    body_com_residual_prev[tid] = body_com_residual[tid]
 
     # Angular velocity
     omega = quat_velocity(q, q_prev, dt)

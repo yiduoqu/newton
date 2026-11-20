@@ -1305,6 +1305,8 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             self.body_q_prev = wp.clone(model.body_q, device=self.device)
             self._coupling_body_q_prev_snapshot = wp.clone(model.body_q, device=self.device)
             self.body_inertia_q = wp.zeros_like(model.body_q, device=self.device)  # inertial target poses
+            self.body_com_residual = wp.zeros(model.body_count, dtype=wp.vec3, device=self.device)
+            self.body_com_residual_prev = wp.zeros_like(self.body_com_residual)
 
             # Adjacency and dimensions
             self.rigid_adjacency = self._compute_rigid_force_element_adjacency(model).to(self.device)
@@ -4710,6 +4712,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                     self.tendon_segment_active,
                     self.tendon_segment_active_guide_l,
                     self.tendon_segment_active_guide_r,
+                    self.body_com_residual,
                 ],
                 outputs=[
                     state_in.body_q,
@@ -5142,8 +5145,15 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 dt,
                 state_in.body_q,
                 model.body_com,
+                self.body_com_residual,
             ],
-            outputs=[self.body_q_prev, state_out.body_qd, state_in.body_qd, state_out.body_q],
+            outputs=[
+                self.body_q_prev,
+                self.body_com_residual_prev,
+                state_out.body_qd,
+                state_in.body_qd,
+                state_out.body_q,
+            ],
             dim=model.body_count,
             device=self.device,
         )
